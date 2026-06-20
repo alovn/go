@@ -1,0 +1,217 @@
+name: Build & Release (macOS darwin/amd64)
+
+# Build the Go 1.26.4 toolchain from this source tree for darwin/amd64
+# and publish a GitHub Release with the resulting binary tarball and a
+# source archive.
+#
+# This fork is for local development on legacy macOS. It produces a
+# darwin/amd64 binary only;
+#
+
+"on":
+  push:
+    # Only fire on tags that look like the port branch, e.g. go1.26.4-macosx-compat.
+    tags:
+      - "go*-macosx"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and upload artifacts only; do not create or modify a GitHub Release"
+        required: false
+        type: boolean
+        default: false
+      macos_amd64_runner:
+        description: "GitHub-hosted macOS runner image used to build darwin/amd64"
+        required: false
+        type: choice
+        # NOTE: do not reorder/rename these options. Workflow
+        # callers depend on these exact values; changing them is
+        # a breaking change for anyone using workflow_dispatch.
+        options:
+          - macos-26-intel
+          - macos-15-intel
+          - macos-14-large
+        default: macos-26-intel
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & release darwin/amd64
+    # On push triggers, `inputs.*` is undefined, so fall back to the
+    # workflow_dispatch default. The default is also declared on the
+    # input below; we duplicate it here rather than reference the
+    # input's `default` (GitHub Actions expression syntax does not
+    # allow `inputs.<name>.default`).
+    runs-on: ${{ inputs.macos_amd64_runner || 'macos-26-intel' }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          # Shallow fetch is enough for `make.bash`; we only need a
+          # commit SHA for the release notes.
+          fetch-depth: 1
+
+      - name: Set up Go bootstrap toolchain
+        uses: actions/setup-go@v5
+        with:
+          # Building Go 1.26.x requires Go 1.24+ as the bootstrap.
+          go-version: "1.24.11"
+          cache: false
+
+      - name: Read VERSION
+        id: version
+        # Read the first non-blank line of the VERSION file at the repo
+        # root, strip the leading "go" prefix, and export the result
+        # both as a step output (steps.version.outputs.version) and
+        # into the job's $GITHUB_ENV so subsequent steps can reference
+        # $VERSION directly. Now that everything is in one job, this
+        # step only needs to run once.
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(head -n1 "$GITHUB_WORKSPACE/VERSION" | sed -e 's/^go//' -e 's/[[:space:]].*//')
+          {
+            echo "version=${ver}"
+            echo "VERSION=${ver}"
+          } >> "$GITHUB_OUTPUT"
+          echo "VERSION=${ver}" >> "$GITHUB_ENV"
+
+      - name: Build the toolchain
+        shell: bash
+        env:
+          GOOS:   darwin
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          cd src
+          # CGO is enabled because Security.framework is exercised by
+          # crypto/x509 during the build's self-check; the macOS
+          # runners have clang and the SDK installed by default.
+          export CGO_ENABLED=1
+          ./make.bash
+
+      - name: Verify the built toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -x bin/go ]; then
+            echo "::error::built binary bin/go not found"
+            exit 1
+          fi
+          ./bin/go version
+          ./bin/go env GOROOT GOOS GOARCH
+
+      - name: Stage output directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `make.bash` populated bin/, pkg/, src/, ... in the repo
+          # root. Pack them into ./dist/ so the release action picks
+          # them up via dist/*.tar.gz. The source tree is included
+          # inside the binary tarball (the `src/` directory) and is
+          # enough for a downstream user to rebuild or patch; we do
+          # not publish a separate source-only tarball.
+          rm -rf dist
+          mkdir -p dist
+          tar -czf "dist/go-${VERSION}.darwin-amd64.tar.gz" \
+            bin pkg src api doc lib misc test \
+            go.env VERSION CONTRIBUTING.md LICENSE PATENTS README.md SECURITY.md codereview.cfg
+          ls -la dist/
+
+      - name: Build release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## go${VERSION}"
+            echo
+            echo "Build of the Go toolchain from source tree at $(git rev-parse --short HEAD) ($(git rev-parse HEAD))."
+            echo
+            echo "### Scope"
+            echo
+            echo "This fork produces a darwin/amd64 binary only."
+            echo
+            echo "### macOS 10.13 (High Sierra) 10.14 (Mojave) 10.15 (Catalina) 11.x(Big Sur) compatibility"
+            echo
+            echo "This build includes the local patch that allows the toolchain binary to load on macOS 10.13 (High Sierra) through 11.x (Big Sur). The patch is described in \`doc/macosx_compat.zh.md\` and \`doc/macosx_compat.en.md\` at the root of the toolchain tree."
+            echo
+            echo "Key trade-off: x509.Verify on darwin returns a single-element chain on macOS < 12. See section of the documentation for the runtime impact analysis."
+            echo
+            echo "### Assets"
+            echo
+            echo "| File | Notes |"
+            echo "| --- | --- |"
+            for f in dist/*.tar.gz; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              case "$base" in
+                *.darwin-amd64.*) echo "| $base | darwin/amd64 toolchain, macOS 10.13+ (Intel) |" ;;
+                *)                echo "| $base | unexpected asset, please report |" ;;
+              esac
+            done
+            echo
+            echo "### Verifying the build"
+            echo
+            echo '```sh'
+            echo "# Unpack and check the toolchain"
+            echo "tar -xzf go-${VERSION}.darwin-amd64.tar.gz"
+            echo "go/bin/go version"
+            echo "go/bin/go env GOROOT GOOS GOARCH"
+            echo
+            echo "# Confirm the Mach-O minos patch is in place"
+            echo "otool -l go/bin/go | grep -A6 LC_BUILD_VERSION"
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+          # Surface the rendered release notes as a step output so the
+          # softprops action below can use them as `body` directly,
+          # rather than passing the file path.
+          {
+            echo "body<<EOF"
+            cat release-notes.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide release tag/name
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="go${VERSION}-macosx"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "name=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        # Only publish a release on tag pushes, or on manual runs with
+        # dry_run=false. Plain branch pushes are smoke-test runs and
+        # must not create a new release on every commit.
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.dry_run != true) }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name:     ${{ steps.meta.outputs.name }}
+          body:     ${{ steps.notes.outputs.body }}
+          draft:       false
+          prerelease:  false
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: false
+          generate_release_notes: false

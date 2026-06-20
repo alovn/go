@@ -10,6 +10,7 @@ import (
 	"errors"
 	"internal/abi"
 	"strconv"
+	"sync"
 	"unsafe"
 )
 
@@ -135,13 +136,47 @@ func SecCertificateCopyData(cert CFRef) ([]byte, error) {
 }
 func x509_SecCertificateCopyData_trampoline()
 
-//go:cgo_import_dynamic x509_SecTrustCopyCertificateChain SecTrustCopyCertificateChain "/System/Library/Frameworks/Security.framework/Versions/A/Security"
+// Local patch: SecTrustCopyCertificateChain is a macOS 12+ API. We
+// resolve it at runtime via dlopen/dlsym (declared in dlopen.go) so the
+// Go toolchain binary does not require the symbol at load time and can
+// still run on macOS Catalina (10.15). On older macOS versions, dlsym
+// returns NULL and we surface an error; the caller in root_darwin.go
+// handles that by treating the chain as empty.
+var (
+	secTrustCopyChainOnce sync.Once
+	secTrustCopyChainFn   uintptr // function pointer to SecTrustCopyCertificateChain
+	secTrustCopyChainErr  error
+)
+
+func loadSecTrustCopyCertificateChain() (uintptr, error) {
+	secTrustCopyChainOnce.Do(func() {
+		h := dlopenGo("/System/Library/Frameworks/Security.framework/Security")
+		if h == nil {
+			secTrustCopyChainErr = errors.New("dlopen Security.framework failed")
+			return
+		}
+		p := dlsymGo(h, "SecTrustCopyCertificateChain")
+		if p == nil {
+			secTrustCopyChainErr = errors.New("SecTrustCopyCertificateChain is not available on this macOS version (requires 12+)")
+			return
+		}
+		secTrustCopyChainFn = uintptr(p)
+	})
+	return secTrustCopyChainFn, secTrustCopyChainErr
+}
 
 func SecTrustCopyCertificateChain(trustObj CFRef) (CFRef, error) {
-	ret := syscall(abi.FuncPCABI0(x509_SecTrustCopyCertificateChain_trampoline), uintptr(trustObj), 0, 0, 0, 0, 0)
+	fn, err := loadSecTrustCopyCertificateChain()
+	if err != nil {
+		return 0, err
+	}
+	// Call the dynamically resolved C function via the runtime syscall
+	// helper. The C signature is CFArrayRef SecTrustCopyCertificateChain(
+	// SecTrustRef trust). The Go runtime helper takes up to 5 args; the
+	// extra args are zero and the floating-arg slot is unused.
+	ret := syscall(fn, uintptr(trustObj), 0, 0, 0, 0, 0)
 	if ret == 0 {
-		return 0, OSStatus{"SecTrustCopyCertificateChain", int32(ret)}
+		return 0, OSStatus{"SecTrustCopyCertificateChain", -1}
 	}
 	return CFRef(ret), nil
 }
-func x509_SecTrustCopyCertificateChain_trampoline()

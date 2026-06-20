@@ -75,20 +75,30 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	chain := [][]*Certificate{{}}
 	chainRef, err := macos.SecTrustCopyCertificateChain(trustObj)
 	if err != nil {
-		return nil, err
-	}
-	defer macos.CFRelease(chainRef)
-	for i := 0; i < macos.CFArrayGetCount(chainRef); i++ {
-		certRef := macos.CFArrayGetValueAtIndex(chainRef, i)
-		cert, err := exportCertificate(certRef)
-		if err != nil {
+		// Local patch: SecTrustCopyCertificateChain is a macOS 12+ API.
+		// On older macOS versions (e.g. 10.15 Catalina) it is not
+		// available. Fall back to a single-element chain containing the
+		// leaf certificate so the rest of the verification pipeline can
+		// still run.
+		leafCert, leafErr := exportCertificate(leaf)
+		if leafErr != nil {
 			return nil, err
 		}
-		chain[0] = append(chain[0], cert)
-	}
-	if len(chain[0]) == 0 {
-		// This should _never_ happen, but to be safe
-		return nil, errors.New("x509: macos certificate verification internal error")
+		chain[0] = append(chain[0], leafCert)
+	} else {
+		defer macos.CFRelease(chainRef)
+		for i := 0; i < macos.CFArrayGetCount(chainRef); i++ {
+			certRef := macos.CFArrayGetValueAtIndex(chainRef, i)
+			cert, err := exportCertificate(certRef)
+			if err != nil {
+				return nil, err
+			}
+			chain[0] = append(chain[0], cert)
+		}
+		if len(chain[0]) == 0 {
+			// This should _never_ happen, but to be safe
+			return nil, errors.New("x509: macos certificate verification internal error")
+		}
 	}
 
 	if opts.DNSName != "" {
